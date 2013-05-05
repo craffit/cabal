@@ -4,6 +4,8 @@ module Distribution.Client.Dependency.Modular.Preference where
 
 import qualified Data.List as L
 import qualified Data.Map as M
+import qualified Data.Set as S
+import Data.Maybe
 import Data.Monoid
 import Data.Ord
 
@@ -13,10 +15,12 @@ import Distribution.Client.Types
   ( OptionalStanza(..) )
 
 import Distribution.Client.Dependency.Modular.Dependency
+import Distribution.Client.Dependency.Modular.Index
 import Distribution.Client.Dependency.Modular.Flag
 import Distribution.Client.Dependency.Modular.Package
 import Distribution.Client.Dependency.Modular.PSQ as P
 import Distribution.Client.Dependency.Modular.Tree
+import Distribution.Client.Dependency.Modular.Validate
 import Distribution.Client.Dependency.Modular.Version
 
 -- | Generic abstraction for strategies that just rearrange the package order.
@@ -29,6 +33,33 @@ packageOrderFor p cmp = trav go
       | otherwise                   = PChoiceF v r                               cs
     go x                            = x
 
+-- | Generic abstraction for strategies that just rearrange the package order.
+-- This version also includes the direct dependencies of the top packages 
+-- to the comparator. This way a different preference can be given 
+-- to direct dependencies.
+packageOrderDirectDeps :: S.Set PN -> Index 
+                       -> ([PN] -> PN -> I -> I -> Ordering) -> Tree a -> Tree a
+packageOrderDirectDeps top idx cmp t = cata go t ([], M.empty, M.empty)
+  where
+    go z x@(dDeps, flags, stanzas) =
+      case z of
+        PChoiceF v@(Q _ pn) r cs ->
+          let childs       = P.mapWithKey (\i f -> f (nDat i)) cs
+              nDat i       = ( (if pn `S.member` top then (directDeps i ++) else id) dDeps
+                             , flags, stanzas)
+              directDeps i = fromMaybe [] $
+                               do pkg <- M.lookup pn idx 
+                                  PInfo dps _ _ _ <- M.lookup i pkg
+                                  return $ L.map (\(Dep n _) -> unQualify n) 
+                                         $ extractDeps flags stanzas 
+                                         $ L.map (fmap (Q [])) dps
+          in  PChoice v r (P.sortByKeys (flip (cmp dDeps pn)) childs)
+        FChoiceF n a b c cs -> FChoice n a b c 
+                             $ P.mapWithKey (\i f -> f (dDeps, M.insert n i flags, stanzas)) cs
+        SChoiceF n a b   cs -> SChoice n a b   
+                             $ P.mapWithKey (\i f -> f (dDeps, flags, M.insert n i stanzas)) cs
+        _                   -> inn (fmap ($x) z)
+
 -- | Ordering that treats preferred versions as greater than non-preferred
 -- versions.
 preferredVersionsOrdering :: VR -> Ver -> Ver -> Ordering
@@ -37,25 +68,31 @@ preferredVersionsOrdering vr v1 v2 =
 
 -- | Traversal that tries to establish package preferences (not constraints).
 -- Works by reordering choice nodes.
-preferPackagePreferences :: (PN -> PackagePreferences) -> Tree a -> Tree a
-preferPackagePreferences pcs = packageOrderFor (const True) preference
+preferPackagePreferences :: S.Set PN -> Index 
+                          -> (PN -> PackagePreferences) -> Tree a -> Tree a
+preferPackagePreferences topLevel idx pcs = 
+    packageOrderDirectDeps topLevel idx preference
   where
-    preference pn i1@(I v1 _) i2@(I v2 _) =
+    preference dDeps pn i1@(I v1 _) i2@(I v2 _) =
       let PackagePreferences vr ipref = pcs pn
       in  preferredVersionsOrdering vr v1 v2 `mappend` -- combines lexically
-          locationsOrdering ipref i1 i2
+          locationsOrdering (pn `elem` dDeps) ipref i1 i2
 
     -- Note that we always rank installed before uninstalled, and later
     -- versions before earlier, but we can change the priority of the
     -- two orderings.
-    locationsOrdering PreferInstalled v1 v2 =
+    locationsOrdering _ PreferInstalled v1 v2 =
       preferInstalledOrdering v1 v2 `mappend` preferLatestOrdering v1 v2
-    locationsOrdering PreferLatest v1 v2 =
+    locationsOrdering _ PreferLatest v1 v2 =
       preferLatestOrdering v1 v2 `mappend` preferInstalledOrdering v1 v2
-    -- For the oldest ordering we just prefer the oldest installed version
-    locationsOrdering PreferOldest v1 v2 = 
+    -- For the oldest ordering we just prefer the oldest installed version, 
+    -- this is only done for direct dependencies. Other dependencies 
+    -- use the PreferInstalled
+    locationsOrdering True PreferOldest v1 v2 = 
       preferInstalledOrdering v1 v2 `mappend` preferLatestOrdering v2 v1
-
+    locationsOrdering False PreferOldest v1 v2 = 
+      locationsOrdering False PreferInstalled v1 v2
+ 
 -- | Ordering that treats installed instances as greater than uninstalled ones.
 preferInstalledOrdering :: I -> I -> Ordering
 preferInstalledOrdering (I _ (Inst _)) (I _ (Inst _)) = EQ

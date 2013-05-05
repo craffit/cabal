@@ -1,6 +1,7 @@
 module Distribution.Client.Dependency.Modular.Solver where
 
 import Data.Map as M
+import Data.Set as S
 
 import Distribution.Client.Dependency.Types
 
@@ -43,7 +44,7 @@ solve sc idx userPrefs userConstraints userGoals =
                        if preferEasyGoalChoices sc
                          then P.preferBaseGoalChoice . P.deferDefaultFlagChoices . P.lpreferEasyGoalChoices
                          else P.preferBaseGoalChoice
-    preferencesPhase = P.preferPackagePreferences userPrefs
+    preferencesPhase = P.preferPackagePreferences (S.fromList userGoals) idx userPrefs
     validationPhase  = P.enforceManualFlags . -- can only be done after user constraints
                        P.enforcePackageConstraints userConstraints .
                        validateTree idx
